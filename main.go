@@ -10,8 +10,18 @@ import (
 	"strings"
 )
 
+type PackageImports struct {
+	Name           string
+	Package        *build.Package
+	Imports        []string
+	PackageImports []*PackageImports
+	Count          int
+}
+
 var (
-	pkgs        map[string]*build.Package
+	pkgTree *PackageImports = &PackageImports{}
+
+	pkgs        map[string]*PackageImports
 	erroredPkgs map[string]bool
 	ids         map[string]string
 
@@ -48,7 +58,7 @@ func init() {
 }
 
 func main() {
-	pkgs = make(map[string]*build.Package)
+	pkgs = make(map[string]*PackageImports)
 	erroredPkgs = make(map[string]bool)
 	ids = make(map[string]string)
 	flag.Parse()
@@ -79,12 +89,35 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to get cwd: %s", err)
 	}
-	for _, a := range args {
-		if err := processPackage(cwd, a, 0, "", *stopOnError); err != nil {
-			log.Fatal(err)
-		}
+	// for _, a := range args {
+	// 	if err := processPackage(cwd, a, 0, "", *stopOnError); err != nil {
+	// 		log.Fatal(err)
+	// 	}
+	// }
+	a := args[0]
+	if err := processPackage(cwd, pkgTree, a, 0, "", *stopOnError); err != nil {
+		log.Fatal(err)
 	}
 
+	listed := map[string]struct{}{}
+	printTree(pkgTree, 0, listed)
+}
+
+func printTree(root *PackageImports, level int, listed map[string]struct{}) {
+	if _, ok := listed[root.Name]; ok {
+		return
+	}
+	for i := 0; i < level; i++ {
+		fmt.Print(" |")
+	}
+	fmt.Printf("%v %d\n", root.Name, root.Count)
+	listed[root.Name] = struct{}{}
+	for _, pi := range root.PackageImports {
+		printTree(pi, level+1, listed)
+	}
+}
+
+func printGraphviz() {
 	fmt.Println("digraph godep {")
 	if *horizontal {
 		fmt.Println(`rankdir="LR"`)
@@ -104,7 +137,8 @@ edge [arrowsize="0.5"]
 	sort.Strings(pkgKeys)
 
 	for _, pkgName := range pkgKeys {
-		pkg := pkgs[pkgName]
+		pi := pkgs[pkgName]
+		pkg := pi.Package
 		pkgId := getId(pkgName)
 
 		if isIgnored(pkg) {
@@ -132,13 +166,13 @@ edge [arrowsize="0.5"]
 			continue
 		}
 
-		for _, imp := range getImports(pkg) {
-			impPkg := pkgs[imp]
+		for _, imp := range pi.PackageImports {
+			impPkg := imp.Package
 			if impPkg == nil || isIgnored(impPkg) {
 				continue
 			}
 
-			impId := getId(imp)
+			impId := getId(imp.Name)
 			fmt.Printf("%s -> %s;\n", pkgId, impId)
 		}
 	}
@@ -149,7 +183,7 @@ func pkgDocsURL(pkgName string) string {
 	return "https://godoc.org/" + pkgName
 }
 
-func processPackage(root string, pkgName string, level int, importedBy string, stopOnError bool) error {
+func processPackage(root string, curPackage *PackageImports, pkgName string, level int, importedBy string, stopOnError bool) error {
 	if level++; level > *maxLevel {
 		return nil
 	}
@@ -173,17 +207,32 @@ func processPackage(root string, pkgName string, level int, importedBy string, s
 		erroredPkgs[importPath] = true
 	}
 
-	pkgs[importPath] = pkg
+	//pkgs[importPath] = pkg
+	curPackage.Name = importPath
+	curPackage.Package = pkg
+	curPackage.Imports = getImports(pkg)
+	curPackage.PackageImports = make([]*PackageImports, 0, len(curPackage.Imports))
+	curPackage.Count = 1
+	pkgs[importPath] = curPackage
 
 	// Don't worry about dependencies for stdlib packages
 	if pkg.Goroot && !*withGoroot {
 		return nil
 	}
 
-	for _, imp := range getImports(pkg) {
-		if _, ok := pkgs[imp]; !ok {
-			if err := processPackage(pkg.Dir, imp, level, pkgName, stopOnError); err != nil {
+	for _, imp := range curPackage.Imports {
+		if pi, ok := pkgs[imp]; ok {
+			pi.Count++
+			curPackage.PackageImports = append(curPackage.PackageImports, pi)
+		} else {
+			// new package
+			next := &PackageImports{}
+			if err := processPackage(pkg.Dir, next, imp, level, pkgName, stopOnError); err != nil {
 				return err
+			}
+			// this may not get filled in if the package is ignored
+			if next.Name != "" {
+				curPackage.PackageImports = append(curPackage.PackageImports, next)
 			}
 		}
 	}
